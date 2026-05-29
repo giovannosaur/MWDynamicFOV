@@ -1,163 +1,146 @@
-// dllmain.cpp
+// dllmain.cpp MW
 #include "pch.h"
 #include <windows.h>
 #include <stdint.h>
 #include <cmath>
-#include <stdio.h>   // for atof
+#include <stdlib.h>  // atof
 #include <string.h>
 
-int toggleKey = 0;
+// =========================
+// addresses & game refs
+// =========================
+int* GameState = (int*)0x925E90;        // 6 = gameplay
+uint8_t* NisState = (uint8_t*)0x91606C;    // 0 = not in NIS
 
-// configurable default values
+volatile float* speedAddr = (float*)0x009142C8;
+volatile uint16_t* fovAddr = (uint16_t*)0x00986934;
+
+// original fov writer patch
+BYTE      originalBytes[7] = { 0x66, 0x89, 0x81, 0xC4, 0x00, 0x00, 0x00 };
+BYTE      nopBytes[7] = { 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
+uintptr_t patchAddr = 0x0047DC9E;
+
+// =========================
+// config
+// =========================
+int      cfg_toggleKey = 118;
 uint16_t cfg_initial_fov = 15000;
 uint16_t cfg_max_fov = 24000;
 float    cfg_max_speed = 80.0f;
 int      cfg_graph_type = 1;
+bool     cfg_permanentEnable = false;
 
-// original bytes for instruction at 0x0047DC9E
-BYTE originalBytes[7] = { 0x66, 0x89, 0x81, 0xC4, 0x00, 0x00, 0x00 };
-BYTE nopBytes[7] = { 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
+// =========================
+// runtime state
+// =========================
+bool userWantsEnabled = false;
+bool effectActive = false;
+bool lastPatchState = false;
 
-// patch target (nfsmw)
-uintptr_t patchAddr = 0x0047DC9E;
-
-// memory
-volatile float* speed_ptr = (float*)0x009142C8;
-volatile uint16_t* fov_ptr = (uint16_t*)0x00986934;
-
-
+// =========================
+// helpers
+// =========================
 void PatchBytes(bool enable)
 {
     DWORD oldProtect;
     VirtualProtect((LPVOID)patchAddr, 7, PAGE_EXECUTE_READWRITE, &oldProtect);
-
-    if (enable)
-        memcpy((void*)patchAddr, nopBytes, 7);
-    else
-        memcpy((void*)patchAddr, originalBytes, 7);
-
+    memcpy((void*)patchAddr, enable ? nopBytes : originalBytes, 7);
     VirtualProtect((LPVOID)patchAddr, 7, oldProtect, &oldProtect);
 }
 
-void LoadConfig()
+void UpdatePatch(bool shouldEnable)
 {
-    // hotkey
-    toggleKey = GetPrivateProfileIntA(
-        "hotkeys",
-        "toggle_fov",
-        118,
-        ".\\DFconfig.ini"
-    );
-
-    // fov settings
-    cfg_initial_fov = (uint16_t)GetPrivateProfileIntA(
-        "settings",
-        "initial_fov",
-        15000,
-        ".\\DFconfig.ini"
-    );
-
-    cfg_max_fov = (uint16_t)GetPrivateProfileIntA(
-        "settings",
-        "max_fov",
-        24000,
-        ".\\DFconfig.ini"
-    );
-
-    cfg_graph_type = GetPrivateProfileIntA(
-        "settings",
-        "graph_type",
-        1,
-        ".\\DFconfig.ini"
-    );
-
-    // speed limit: allow floats in ini (better than cast-int)
-    char buf[64] = { 0 };
-    GetPrivateProfileStringA("speed", "max_speed", "80.0", buf, sizeof(buf), ".\\DFconfig.ini");
-    cfg_max_speed = (float)atof(buf);
-    if (cfg_max_speed <= 0.0f) cfg_max_speed = 80.0f;
+    if (shouldEnable != lastPatchState)
+    {
+        PatchBytes(shouldEnable);
+        lastPatchState = shouldEnable;
+    }
 }
-
-bool effectEnabled = false;
 
 float ApplyGraph(float t)
 {
-    // clamp t 0..1
     if (t < 0.0f) t = 0.0f;
     if (t > 1.0f) t = 1.0f;
 
     switch (cfg_graph_type)
     {
-    case 0:
-        // linear
-        return t;
-
-    case 1:
-        // cubic in
-        return t * t * t;
-
-    case 2:
-        // cubic out
-        return 1.0f - powf(1.0f - t, 3.0f);
-
-    default:
-        return t;
+    case 0: return t;                               // linear
+    case 1: return t * t * t;                       // cubic in
+    case 2: return 1.0f - powf(1.0f - t, 3.0f);    // cubic out
+    default: return t;
     }
 }
 
-DWORD WINAPI FovThread(void*)
+void LoadConfig()
 {
-    // use the addresses provided above
-    volatile float* speed = speed_ptr;
-    volatile uint16_t* fov = fov_ptr;
+    cfg_toggleKey = GetPrivateProfileIntA("hotkeys", "toggle_fov", 118, ".\\DFconfig.ini");
 
-    // sanity check: if pointers are null, stop
-    if (!speed || !fov) return 0;
+    cfg_initial_fov = (uint16_t)GetPrivateProfileIntA("settings", "initial_fov", 15000, ".\\DFconfig.ini");
+    cfg_max_fov = (uint16_t)GetPrivateProfileIntA("settings", "max_fov", 24000, ".\\DFconfig.ini");
+    cfg_graph_type = GetPrivateProfileIntA("settings", "graph_type", 1, ".\\DFconfig.ini");
+
+    // float-safe max_speed read
+    char buf[64] = { 0 };
+    GetPrivateProfileStringA("speed", "max_speed", "80.0", buf, sizeof(buf), ".\\DFconfig.ini");
+    cfg_max_speed = (float)atof(buf);
+    if (cfg_max_speed <= 0.0f) cfg_max_speed = 80.0f;
+
+    cfg_permanentEnable = GetPrivateProfileIntA("settings", "permanentEnable", 0, ".\\DFconfig.ini") != 0;
+
+    userWantsEnabled = cfg_permanentEnable;
+}
+
+// =========================
+// main thread
+// =========================
+DWORD WINAPI MainThread(void*)
+{
+    LoadConfig();
 
     while (true)
     {
-        if (effectEnabled)
+        bool inGameplay = (*GameState == 6);
+        bool inNIS = (*NisState != 0);
+        bool gameAllowsFov = inGameplay && !inNIS;
+
+        // hotkey only valid in gameplay
+        if (inGameplay && (GetAsyncKeyState(cfg_toggleKey) & 1))
+            userWantsEnabled = !userWantsEnabled;
+
+        effectActive = userWantsEnabled && gameAllowsFov;
+
+        UpdatePatch(effectActive);
+
+        if (effectActive)
         {
-            float s = *speed;
-            if (s < 0.0f) s = 0.0f;
+            float s = *speedAddr;
+            if (s < 0.0f)          s = 0.0f;
             if (s > cfg_max_speed) s = cfg_max_speed;
 
             float t = s / cfg_max_speed;
             float eased = ApplyGraph(t);
 
-            float ff = (float)cfg_initial_fov + (float)(cfg_max_fov - cfg_initial_fov) * eased;
+            float f = cfg_initial_fov + (cfg_max_fov - cfg_initial_fov) * eased;
 
-            if (ff > cfg_max_fov) ff = (float)cfg_max_fov;
-            if (ff < cfg_initial_fov) ff = (float)cfg_initial_fov;
+            if (f > cfg_max_fov)    f = (float)cfg_max_fov;
+            if (f < cfg_initial_fov) f = (float)cfg_initial_fov;
 
-            *fov = (uint16_t)ff;
+            *fovAddr = (uint16_t)f;
         }
 
         SwitchToThread();
     }
 }
 
-DWORD WINAPI HotkeyThread(void*)
-{
-    LoadConfig();
-
-    while (true)
-    {
-        if (GetAsyncKeyState(toggleKey) & 1)
-        {
-            effectEnabled = !effectEnabled;
-            PatchBytes(effectEnabled);
-        }
-        Sleep(1);
-    }
-}
-
+// =========================
+// dll entry
+// =========================
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID)
 {
     if (reason == DLL_PROCESS_ATTACH)
     {
-        CreateThread(nullptr, 0, FovThread, nullptr, 0, nullptr);
-        CreateThread(nullptr, 0, HotkeyThread, nullptr, 0, nullptr);
+        DisableThreadLibraryCalls(hModule);
+        CreateThread(nullptr, 0, MainThread, nullptr, 0, nullptr);
     }
     return TRUE;
 }
